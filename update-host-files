@@ -1,0 +1,55 @@
+#!/bin/bash
+URL="http://hosts-file.net"
+TMP_DIR="/tmp/hosts_files"
+HOST_FILES="ad_servers emd exp fsa grm hjk mmt psh"
+CURRENT_HOST_FILES=/etc/dnsmasq
+WHITE_LIST_DIR=$CURRENT_HOST_FILES/white_lists
+NEW_HOSTS="false"
+
+logger -i -t host-files "...checking host files for new versions..."
+
+if [ ! -d "$TMP_DIR" ]; then
+    mkdir -p  $TMP_DIR
+fi
+
+if [ ! -d "$CURRENT_HOST_FILES" ]; then
+    mkdir -p $CURRENT_HOST_FILES
+fi
+
+for i in $HOST_FILES
+do
+    TARGET_FILE=${i}.txt
+
+    if [ -a $CURRENT_HOST_FILES/$i ]; then
+        CURRENT_HEADER=$(head -n 1 $CURRENT_HOST_FILES/$i | cut -d "#" -f 2)
+    else
+        CURRENT_HEADER=" "
+    fi
+
+    LATEST_HEADER=`curl -I -silent $URL/$TARGET_FILE | grep "Last-Modified:"`
+    
+    if [ "$CURRENT_HEADER" != "$LATEST_HEADER" ]; then
+	NEW_HOSTS="true"    	
+        wget -O $TMP_DIR/$TARGET_FILE $URL/$TARGET_FILE
+        sed -i "1i#$LATEST_HEADER" "$TMP_DIR/$TARGET_FILE"
+        if [ -a $WHITE_LIST_DIR/$i ]; then
+            while IFS='' read -r line; do
+                echo "removing ${line}"
+	    	sed --in-place "/${line}/d" "$TMP_DIR/$TARGET_FILE"
+            done < $WHITE_LIST_DIR/$i
+        fi
+
+        if [ -a $CURRENT_HOST_FILES/$i ]; then
+            mv $CURRENT_HOST_FILES/$i $CURRENT_HOST_FILES/$i.old
+        fi
+        cp $TMP_DIR/$TARGET_FILE $CURRENT_HOST_FILES/$i
+   	logger -i -t host-files "$i host file has been updated" 
+    fi
+done
+
+rm -rf $TMP_DIR
+
+if [ "$NEW_HOSTS" = "true" ]; then
+    echo "Restarting dnsmasq..."
+    service dnsmasq restart
+fi
