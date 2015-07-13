@@ -1,4 +1,12 @@
 #!/bin/bash
+
+# Use of this script with hosts-file.net should be done 
+# only with written permission from hosts-files.net.
+
+# point to host files in /etc/dnsmasq.conf with addn-hosts=/location/of/host/files
+
+# Wire this up with cron as you prefer...
+
 URL="http://hosts-file.net"
 TMP_DIR="/tmp/hosts_files"
 HOST_FILES="ad_servers emd exp fsa grm hjk mmt psh"
