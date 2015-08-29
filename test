@@ -1,0 +1,11 @@
+#!/bin/bash
+
+echo "start"
+
+if [[ -n $(curl -I http://hosts-file.net | grep "HTTP/1.1 503 Service Unavailable") ]]; then
+    echo "bork"
+    exit 1
+fi
+echo "working"
+exit 0
+

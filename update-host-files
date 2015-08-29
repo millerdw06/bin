@@ -1,12 +1,4 @@
 #!/bin/bash
-
-# Use of this script with hosts-file.net should be done 
-# only with written permission from hosts-files.net.
-
-# point to host files in /etc/dnsmasq.conf with addn-hosts=/location/of/host/files
-
-# Wire this up with cron as you prefer...
-
 URL="http://hosts-file.net"
 TMP_DIR="/tmp/hosts_files"
 HOST_FILES="ad_servers emd exp fsa grm hjk mmt psh"
@@ -14,50 +6,61 @@ CURRENT_HOST_FILES=/etc/dnsmasq
 WHITE_LIST_DIR=$CURRENT_HOST_FILES/white_lists
 NEW_HOSTS="false"
 
-logger -i -t host-files "...checking host files for new versions..."
+if [[ -n $(curl -I $url | grep "HTTP/1.1 503 Service Unavailable") ]]; then
+    logger -i -t host-files "...HTTP/1.1 503 Service Unavailable..."
+    exit 0
+fi
 
-if [ ! -d "$TMP_DIR" ]; then
+if [[ ! -d $TMP_DIR ]]; then
     mkdir -p  $TMP_DIR
 fi
 
-if [ ! -d "$CURRENT_HOST_FILES" ]; then
+if [[ ! -d $CURRENT_HOST_FILES ]]; then
     mkdir -p $CURRENT_HOST_FILES
 fi
 
 for i in $HOST_FILES
 do
-    TARGET_FILE=${i}.txt
-
-    if [ -a $CURRENT_HOST_FILES/$i ]; then
-        CURRENT_HEADER=$(head -n 1 $CURRENT_HOST_FILES/$i | cut -d "#" -f 2)
-    else
-        CURRENT_HEADER=" "
-    fi
-
-    LATEST_HEADER=`curl -I -silent $URL/$TARGET_FILE | grep "Last-Modified:"`
     
-    if [ "$CURRENT_HEADER" != "$LATEST_HEADER" ]; then
-	NEW_HOSTS="true"    	
-        wget -O $TMP_DIR/$TARGET_FILE $URL/$TARGET_FILE
-        sed -i "1i#$LATEST_HEADER" "$TMP_DIR/$TARGET_FILE"
-        if [ -a $WHITE_LIST_DIR/$i ]; then
-            while IFS='' read -r line; do
-                echo "removing ${line}"
-	    	sed --in-place "/${line}/d" "$TMP_DIR/$TARGET_FILE"
-            done < $WHITE_LIST_DIR/$i
-        fi
+    TARGET_FILE=${i}.txt
+    HEADER_FILE=$TMP_DIR/${i}.header
+    curl -I -silent $URL/$TARGET_FILE > $HEADER_FILE
+    REMOTE_FILE_STATUS=$(cat $HEADER_FILE | grep "HTTP/1.1 200 OK")
 
-        if [ -a $CURRENT_HOST_FILES/$i ]; then
-            mv $CURRENT_HOST_FILES/$i $CURRENT_HOST_FILES/$i.old
+    if [[ -n $REMOTE_FILE_STATUS ]]; then
+
+        LOCAL_FILE_LAST_MODIFIED=$(head -n 1 $CURRENT_HOST_FILES/$i | cut -d "#" -f 2)
+        REMOTE_FILE_LAST_MODIFIED=$(cat $TMP_DIR/${i}.header | grep "Last-Modified:")
+
+        if [[ $LOCAL_FILE_LAST_MODIFIED != $REMOTE_FILE_LAST_MODIFIED ]]; then
+            
+            NEW_HOSTS="true"
+            #download new host file
+            wget -O $TMP_DIR/$TARGET_FILE $URL/$TARGET_FILE
+            #write "last-modified to new file"
+            sed -i "1i#$LATEST_HEADER" "$TMP_DIR/$TARGET_FILE"
+
+            if [[ -a $WHITE_LIST_DIR/$i ]]; then
+                while IFS='' read -r line; do
+                    echo "removing ${line}"
+                    sed --in-place "/${line}/d" "$TMP_DIR/$TARGET_FILE"
+                done < $WHITE_LIST_DIR/$i
+            fi
+
+            if [[ -a $CURRENT_HOST_FILES/$i ]]; then
+                mv $CURRENT_HOST_FILES/$i $CURRENT_HOST_FILES/$i.old
+            fi
+        
+            cp $TMP_DIR/$TARGET_FILE $CURRENT_HOST_FILES/$i
         fi
-        cp $TMP_DIR/$TARGET_FILE $CURRENT_HOST_FILES/$i
-   	logger -i -t host-files "$i host file has been updated" 
+    else
+        logger -i -t host-files "$TARGET_FILE - HTTP/1.1 503 Service Unavailable"
     fi
 done
 
-rm -rf $TMP_DIR
+rm -r $TMP_DIR
 
-if [ "$NEW_HOSTS" = "true" ]; then
+if [[ "$NEW_HOSTS" = "true" ]]; then
     echo "Restarting dnsmasq..."
     service dnsmasq restart
 fi

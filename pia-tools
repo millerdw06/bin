@@ -1,0 +1,410 @@
+#!/bin/bash
+# Description: Script to automate privateinternetacces port forwarding and
+# starting/stopping transmission when connected/disconnected and other stuff
+# Version: 0.9.7.3
+# Author: Philipp Schmitt (philipp<at>schmitt.co)
+# Documentation: cf. pia-tools.groff
+# Dependencies: curl openvpn sudo systemd transmission-daemon unzip
+
+# Source config file
+test "$PIA_CONF" || PIA_CONF='/etc/pia-tools.conf'
+[[ -r "$PIA_CONF" ]] && . $PIA_CONF
+
+# Setup default config if not already set in pia-tools.conf
+if [[ -z "$PIA_CONFIG_DIR" ]]; then
+    PIA_CONFIG_DIR='/etc/openvpn/pia'
+fi
+if [[ -z "$PIA_CONFIG_URL" ]]; then
+    PIA_CONFIG_URL='https://www.privateinternetaccess.com/openvpn/openvpn.zip'
+fi
+if [[ -z "$PIA_COMMON_CONFIG" ]]; then
+    PIA_COMMON_CONFIG="$PIA_CONFIG_DIR/pia_common"
+fi
+if [[ -z "$PIA_SERVERS_FILE" ]]; then
+    PIA_SERVERS_FILE="$PIA_CONFIG_DIR/piaservers"
+fi
+if [[ -z "$PIA_SERVERS_IP_FILE" ]]; then
+    PIA_SERVERS_IP_FILE="$PIA_CONFIG_DIR/piaserverips"
+fi
+if [[ -z "$PIA_PASSWD_FILE" ]]; then
+    PIA_PASSWD_FILE="$PIA_CONFIG_DIR/passwd"
+fi
+if [[ -z "$PIA_CLIENT_ID_FILE" ]]; then
+    PIA_CLIENT_ID_FILE="$PIA_CONFIG_DIR/clientid"
+fi
+if [[ -z "$TRANSMISSION_SETTINGS_FILE" ]]; then
+    TRANSMISSION_SETTINGS_FILE='/var/lib/transmission/settings.json'
+fi
+if [[ -z "$PIA_OPEN_PORT_FILE" ]]; then
+    PIA_OPEN_PORT_FILE="$PIA_CONFIG_DIR/open_port"
+fi
+    PIA_OPEN_PORT="$(cat $PIA_OPEN_PORT_FILE 2>/dev/null)"
+if [[ -z "$NETWORK_DEVICES" ]]; then
+    NETWORK_DEVICES=$(ip route get "$(host privateinternetaccess.com | awk '/has address/ { print $4 }')" | awk '/dev/ { print $5 }')
+fi
+if [[ -z "$VIRT_NET_DEV" ]]; then
+    VIRT_NET_DEV='tun0'
+fi
+
+usage() {
+    echo "Usage: $1 [-p|r] [-a|d] [-u] [-c] [-h]"
+    echo "-p: Request new port"
+    echo "-r: Refresh (request port forwarding again) [default]"
+    echo "-a: Block non VPN traffic (iptables)"
+    echo "-d: Unblock non VPN traffic (iptables) [default]"
+    echo "-g: Use PIA DNS (updates resolv.conf)"
+    echo "-u: Update configuration files"
+    echo "-s: Run setup"
+    echo "-c: Ensure OpenVPN is running. If not stop transmission"
+    echo "-h: Display this message"
+    echo "-v: Verbose output"
+}
+
+# Checks if executed as root. If not reinvoke self with sudo
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        if test "$VERBOSE"; then
+            echo -e "This script must be run as root\nInvoking sudo -- $0 $*" 1>&2
+        fi
+        exec sudo -- "$0" "$@"
+    fi
+}
+
+check_transmission() {
+    #systemctl is-active transmission > /dev/null 2>&1
+    pidof transmission-daemon > /dev/null 2>&1
+}
+
+# Checks if the OpenVPN service is running
+check_ovpn() {
+    local ovpnd="$(systemctl -t service | grep 'pia@.* active')"
+    if [[ -z "$ovpnd" ]]; then
+        echo 'OpenVPN service not running !' >&2
+        if check_transmission; then
+            echo -n 'Stopping transmission... '
+            #systemctl stop transmission
+            kill -9 $(pidof transmission-daemon)
+            echo 'Done!'
+        else
+            echo "Transmission not running" >&2
+        fi
+        systemctl restart iptables
+        return 1
+    fi
+}
+
+info() {
+    local vpn_exit="$(systemctl -t service | grep 'pia@.* active' \
+                    | awk '{ print $NF }')"
+    if check_ovpn; then
+        echo "OpenVPN is running (Exit point: $vpn_exit)"
+    else
+        echo "OpenVPN stopped"
+    fi
+    if check_transmission; then
+        echo "Transmission is running"
+    else
+        echo "Transmission stopped"
+    fi
+}
+
+
+
+iptable_peer_port_update() {
+	echo "Updating iptables..." 
+	systemctl restart iptables 
+	iptables -A TCP -p tcp --dport $PIA_OPEN_PORT_NEW -j ACCEPT -m comment --comment "pia"
+}
+
+
+transmission_peer_port_update() {
+    local transmission_peer_port="$(grep 'peer-port\"' $TRANSMISSION_SETTINGS_FILE | grep -Eo '[0-9]+')"
+    echo "Updating transmission's listening port... "
+    # Check if transmission is running
+    if check_transmission; then
+        # get current listening port
+        transmission_peer_port="$(transmission-remote -si | grep Listenport | grep -oE '[0-9]+')"
+        if [[ "$PIA_OPEN_PORT_NEW" != "$transmission_peer_port" ]]; then
+            transmission-remote -p "$PIA_OPEN_PORT_NEW"
+            # systemctl restart transmission
+            echo 'Checking port...'
+            # TODO The sleep timer may need to be adjusted
+            sleep 5 && transmission-remote -pt
+        fi
+    else
+        # write new listening port to config
+        if test "$PIA_OPEN_PORT_NEW" && \
+           [[ "$PIA_OPEN_PORT_NEW" != "$transmission_peer_port" ]]; then
+            echo "Writing new peer port to transmission's settings.json..."
+            sed -i 's/\(\"peer-port\":\).*,/\1 '"$PIA_OPEN_PORT_NEW"',/' "$TRANSMISSION_SETTINGS_FILE"
+        fi
+        #check_ovpn && systemctl restart transmission
+        #check_ovpn && runuser -l dave -c 'transmission-daemon -g home/dave/.config/transmission'
+    fi
+    echo 'Done!'
+}
+
+# Return a new client ID
+new_client_id() {
+    head -n 100 /dev/urandom | md5sum | tr -d " -" | tee $PIA_CLIENT_ID_FILE
+}
+
+request_port() {
+    local username="$(head -1 $PIA_PASSWD_FILE)"
+    local passwd="$(tail -1 $PIA_PASSWD_FILE)"
+    local local_vpn_ip="$(ip addr show $VIRT_NET_DEV | grep inet | awk '{ print $2 }')"
+    local client_id="$1"
+    [[ -z "$local_vpn_ip" ]] && local_vpn_ip=$LOCAL_IP
+    echo " "
+    echo  "Updating port forwarding... "
+    if test "$VERBOSE"; then
+        echo "Username: $username"
+        echo "Client ID: $client_id"
+        echo "VPN local IP: $local_vpn_ip"
+    fi
+    PIA_OPEN_PORT_NEW="$(\
+        curl -Ld "user=$username&pass=$passwd&client_id=$client_id&local_ip=$local_vpn_ip" \
+        https://www.privateinternetaccess.com/vpninfo/port_forward_assignment \
+        | grep -oE "[0-9]+" 2>&1)"
+    if test "$PIA_OPEN_PORT_NEW"; then
+        echo " "
+        echo "$PIA_OPEN_PORT_NEW" > "$PIA_OPEN_PORT_FILE"
+        echo "Done! Port: $PIA_OPEN_PORT_NEW"
+        if [[ "$PIA_OPEN_PORT_NEW" != "$PIA_OPEN_PORT" ]]; then
+            test "$PIA_OPEN_PORT" && echo "Previous: $PIA_OPEN_PORT"
+        fi
+        # Update firewall rules
+        ##########
+	iptable_peer_port_update
+	transmission_peer_port_update
+   else
+        echo 'Failed'
+   fi
+}
+
+setup() {
+    if [[ -e $PIA_PASSWD_FILE ]]; then
+        echo -en "$PIA_PASSWD_FILE exits.\nRemove it? (y|N) "
+        read delete
+        if [[ $delete == "y" ]]; then
+            rm -f "$PIA_PASSWD_FILE"
+        else
+            update_config
+            return
+        fi
+    fi
+    mkdir -p $PIA_CONFIG_DIR
+    echo -n "Username: "
+    read username
+    echo -ne "Password: "
+    read -s password
+    echo -e "${username}\n${password}" > $PIA_PASSWD_FILE
+    chmod 400 $PIA_PASSWD_FILE
+    echo
+    update_config
+    echo "Now you can connect to the VPN"
+    echo "# systemctl start pia@Sweden"
+}
+
+update_config() {
+    echo -n 'Updating configuration... '
+    local ovpn ovpn_spaceless
+
+    # Clean up
+    rm -f $PIA_CONFIG_DIR/ca.crt $PIA_CONFIG_DIR/*.ovpn
+
+    # Fetch server config files
+    curl -sL -o $PIA_CONFIG_DIR/openvpn.zip $PIA_CONFIG_URL
+    unzip -d $PIA_CONFIG_DIR -q $PIA_CONFIG_DIR/openvpn.zip
+
+    # Replace space by underscore in filenames
+    local ifs_bak=$IFS
+    IFS=$(echo -en "\n\b")
+    for ovpn in "$PIA_CONFIG_DIR"/*.ovpn; do
+        # Rename files so that do not contain spaces
+        ovpn_spaceless=$(sed 's/ /_/g' <<< "$ovpn")
+        if [[ "$ovpn" != "$ovpn_spaceless" ]]; then
+            mv "$ovpn" "$ovpn_spaceless"
+        fi
+        # Append up/down scripts to every ovpn file
+        cat "$PIA_COMMON_CONFIG"  >> "$ovpn_spaceless"
+    done
+    IFS=$ifs_bak
+
+    # Extract server addresses and resolve hosts
+    grep -h "remote " "$PIA_CONFIG_DIR"/*.ovpn | cut -d ' ' -f 2 \
+        | sort -u > "$PIA_SERVERS_FILE"
+    cat "$PIA_SERVERS_FILE" | nslookup \
+        | sed -n 's/Address: \(.*\)/\1/gp' > "$PIA_SERVERS_IP_FILE"
+
+    # why is following dig cmd failing randomly ?
+    #dig -f /tmp/piaservers A +short | sort > $PIA_SERVERS_IP_FILE
+    echo 'Done!'
+}
+
+_dns() {
+    local resolv=/etc/resolv.conf
+    local resolv_bak=/etc/resolv.conf.orig
+
+    if [[ ! -e $resolv_bak ]]; then
+        if mv $resolv $resolv_bak; then
+            test "$VERBOSE" && echo "Backed up $resolv to $resolv_bak"
+        fi
+    fi
+    echo -n "Updating $resolv file... "
+    echo "# Generated by $(basename $0)" > "$resolv"
+    for dns in "$@"; do
+        echo "nameserver $dns" >> "$resolv"
+    done
+    echo 'Done!'
+    test "$VERBOSE" && echo -e "New $resolv:\n$(cat $resolv)"
+}
+
+pia_dns() {
+    _dns '209.222.18.222' '209.222.18.218'
+}
+
+google_dns() {
+   # _dns '8.8.8.8' '8.8.4.4'
+   #Hack!  Points to private local dns server
+   _dns '192.168.1.10'
+}
+
+restore_dns() {
+    if [[ ! -f /etc/resolv.conf.orig ]]; then
+        echo "Could not find a resolv.conf.orig" >&2
+        return 1
+    fi
+    mv -f /etc/resolv.conf.orig /etc/resolv.conf
+}
+
+# If no option -> refresh
+if [[ $# -eq 0 ]]; then
+    action_port=refresh
+    #action_fw=disallow
+fi
+
+# Every function except help needs root permissions
+check_root "$*"
+
+ARGS=$(getopt -o "adprfguscihv" \
+              -l "allow,disallow,\
+                  port,refresh,pia-dns,google-dns,restore-dns,\
+                  restore,force,\
+                  update,setup,info,help,verbose" \
+              -n "$0" -- "$@")
+
+[[ $? -ne 0 ]] && { usage "$(basename $0)"; exit 1; }
+
+eval set -- "$ARGS"
+
+while true; do
+    case "$1" in
+        -a|--allow)
+            test "$action_fw" && exit 1
+            action_fw=allow
+            shift
+            ;;
+        -d|--disallow)
+            test "$action_fw" && exit 1
+            action_fw=disallow
+            shift
+            ;;
+        -p|--port)
+            test "$action_port" && exit 1
+            action_port=portfwd
+            shift
+            ;;
+        -r|--refresh)
+            test "$action_port" && exit 1
+            action_port=refresh
+            shift
+            ;;
+        -g|--pia-dns)
+            test "$action_dns" && exit 1
+            action_dns=pia
+            shift
+            ;;
+        --google-dns)
+            test "$action_dns" && exit 1
+            action_dns=google
+            shift
+            ;;
+	--restore-dns)
+            test "$action_dns" && exit 1
+            action_dns=restore
+            shift
+            ;;
+        --restore)
+            test "$action_dns" && exit 1
+            action_dns=restore
+            action_check=1
+            shift
+            ;;
+        -f|--force)
+            FORCE=1
+            shift
+            ;;
+        -c|--check)
+            action_check=1
+            shift
+            ;;
+        -i|--info)
+            action_info=1
+            shift
+            ;;
+        -s|--setup)
+            action_setup=1
+            shift
+            ;;
+        -u|--update)
+            action_update=1
+            shift
+            ;;
+        -h|--help)
+            action_help=1
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE=1
+            shift
+            ;;
+        --)
+      shift
+      break;;
+    esac
+done
+
+# When started by OpenVPN daemon (up script) this script gets called like this:
+# $0 $@ tun0 1500 1542 10.185.1.6 10.185.1.5 init
+[[ -n $2 ]] && VIRT_NET_DEV=$1
+[[ -n $4 ]] && LOCAL_IP=$4
+
+test "$action_help" && { usage "$(basename $0)"; exit $?; }
+test "$action_info" && { info; exit $?; }
+test "$action_setup" && { setup; exit $?; }
+test "$action_update" && update_config
+test "$action_check" && check_ovpn
+
+case "$action_dns" in
+    google) google_dns ;;
+    restore) restore_dns ;;
+    pia) pia_dns ;;
+esac
+
+# To do...iptables solution to Block Unblock non-VPN traffic if requested
+#not usefully in current network setup...
+
+# Request port forwarding if action_port is set or no other action is
+if test "$action_port"; then
+    client_id="$(cat $PIA_CLIENT_ID_FILE 2>/dev/null)"
+    if [[ -z "$client_id" ]] || [[ "$action_port" == "portfwd" ]]; then
+        client_id=$(new_client_id)
+    fi
+    [[ -z "$FORCE" ]] && check_ovpn
+    request_port "$client_id"
+    unset client_id action_port
+fi
+
+
+exit 0
